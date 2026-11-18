@@ -369,7 +369,7 @@ async function checkApiHealth() {
   try {
     const res = await fetch('/api/health');
     const data = await res.json();
-    if (data?.geminiConfigured) {
+    if (data?.aiConfigured || data?.geminiConfigured) {
       dom.apiStatusDot.className = 'status-dot status-dot-green';
       dom.apiStatusText.textContent = 'Connected';
       dom.apiStatusText.classList.remove('is-offline');
@@ -393,7 +393,7 @@ new ChatController({
   clearBtn: dom.clearChatBtn,
   getVisualContext: () => {
     const activeMedia = getActiveMediaElement();
-    const imageDataUrl = activeMedia ? detector.captureSnapshotDataUrl(activeMedia, 512, 0.68) : null;
+    const imageDataUrl = activeMedia ? detector.captureSnapshotDataUrl(activeMedia, 384, 0.65) : null;
     return {
       mediaMode: state.mode,
       detectedObjects: state.detections.map((d) => ({

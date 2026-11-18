@@ -58,8 +58,11 @@ function renderMessageMarkup(text) {
 }
 
 const AI_SPARK_SVG = `
-  <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-    <path d="M12 2L14.4 9.6L22 12L14.4 14.4L12 22L9.6 14.4L2 12L9.6 9.6L12 2Z" />
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <path
+      d="M12 3a9 9 0 1 0 9 9v-1.5h-7.5v3h4.2A5.5 5.5 0 1 1 12 6.5c1.66 0 3.15.74 4.16 1.9l2.44-2.44A8.96 8.96 0 0 0 12 3Z"
+      fill="currentColor"
+    />
   </svg>
 `;
 
@@ -198,12 +201,36 @@ export class ChatController {
     bubble.innerHTML = `
       <p><strong>Working Project Folder Ready</strong></p>
       <p>Download the complete source folder (HTML, CSS, vanilla JS, Express server, and package config — without private API keys):</p>
-      <a class="chat-download-btn" href="/api/export-project?code=BRUHHD2DCODEFILES" download="ai-vision-project.zip">
+      <button type="button" class="chat-download-btn">
         Download Project Folder (.zip)
-      </a>
-      <p class="chat-export-note">Includes <code>index.html</code>, <code>server.mjs</code>, <code>package.json</code>, <code>src/app.js</code>, <code>src/detector.js</code>, <code>src/chat.js</code>, <code>src/theme.js</code>, <code>src/index.css</code>, and <code>README.md</code>.</p>
-      <p class="chat-export-note">To run the chatbot on your own host, deploy with Node.js (<code>npm install && npm run build && npm start</code>) and set your own <code>GEMINI_API_KEY</code> in <code>.env</code>.</p>
+      </button>
+      <p class="chat-export-note">Includes all 14 flat files (<code>index.html</code>, <code>server.mjs</code>, <code>package.json</code>, <code>app.js</code>, <code>detector.js</code>, <code>chat.js</code>, <code>theme.js</code>, <code>index.css</code>, etc.) — no subfolders needed.</p>
+      <p class="chat-export-note">To run the chatbot on your own host, deploy with Node.js (<code>npm install && npm run build && npm start</code>) and set your own <code>GROQ_API_KEY</code> (or <code>GEMINI_API_KEY</code>) in <code>.env</code>.</p>
     `;
+
+    const downloadBtn = bubble.querySelector('.chat-download-btn');
+    downloadBtn?.addEventListener('click', async () => {
+      downloadBtn.disabled = true;
+      downloadBtn.textContent = 'Preparing ZIP...';
+      try {
+        const res = await fetch('/api/export-project?code=BRUHHD2DCODEFILES');
+        if (!res.ok) throw new Error('Download failed.');
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = 'ai-vision-project.zip';
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+        downloadBtn.textContent = 'Download Project Folder (.zip)';
+      } catch {
+        downloadBtn.textContent = 'Download Failed — Try Again';
+      } finally {
+        downloadBtn.disabled = false;
+      }
+    });
 
     row.appendChild(avatar);
     row.appendChild(bubble);
@@ -236,7 +263,7 @@ export class ChatController {
     const context = typeof this.getVisualContext === 'function' ? this.getVisualContext() : {};
     let fullResponse = '';
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 25000);
+    const timeoutId = setTimeout(() => controller.abort(), 55000);
 
     try {
       const response = await fetch('/api/chat', {

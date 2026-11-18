@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
 import path from 'node:path';
-import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
@@ -56,19 +55,29 @@ function extractReadableErrorMessage(raw) {
   return raw;
 }
 
-function formatGeminiError(error) {
+function formatChatError(error) {
   const raw = error instanceof Error ? error.message : String(error || 'Unknown error');
   const readable = extractReadableErrorMessage(raw);
-  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403') || raw.includes('401')) {
+  const isGroq = raw.startsWith('Groq API error');
+  const providerName = isGroq ? 'Groq' : 'Gemini';
+  const envVarName = isGroq ? 'GROQ_API_KEY' : 'GEMINI_API_KEY';
+
+  if (raw.includes('API_KEY_INVALID') || raw.includes('PERMISSION_DENIED') || raw.includes('403') || raw.includes('401') || raw.includes('invalid_api_key')) {
     return {
       status: 401,
-      message: 'Gemini API authentication failed. Please verify GEMINI_API_KEY in Settings > Secrets.',
+      message: `${providerName} API authentication failed. Please verify your ${envVarName}.`,
     };
   }
-  if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429')) {
+  if (raw.includes('RESOURCE_EXHAUSTED') || raw.includes('429') || raw.includes('rate_limit_exceeded')) {
     return {
       status: 429,
-      message: 'Gemini API rate limit reached. Please wait a moment and try again.',
+      message: `${providerName} free-tier rate limit reached. Wait a moment and try again.`,
+    };
+  }
+  if (raw.includes('NOT_FOUND') || raw.includes('404') || raw.includes('model_not_found')) {
+    return {
+      status: 404,
+      message: `This API key does not have access to the configured ${providerName} model.`,
     };
   }
   if (raw.includes('503') || raw.includes('UNAVAILABLE')) {
@@ -79,7 +88,7 @@ function formatGeminiError(error) {
   }
   return {
     status: 500,
-    message: readable || 'Failed to reach Gemini API.',
+    message: readable || `Failed to reach ${providerName} API.`,
   };
 }
 
@@ -96,7 +105,7 @@ async function withRetry(fn, retries = 1) {
     } catch (error) {
       lastError = error;
       if (attempt < retries && isTransientError(error)) {
-        await new Promise((resolve) => setTimeout(resolve, 350));
+        await new Promise((resolve) => setTimeout(resolve, 450));
         continue;
       }
       throw error;
@@ -127,22 +136,142 @@ async function streamChatModel(ai, model, thinkingLevel, contents, systemInstruc
   return emittedAny;
 }
 
+async function sendGroqRequest(groqApiKey, model, groqMessages, abortSignal) {
+  const response = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${groqApiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      messages: groqMessages,
+      stream: true,
+      max_tokens: 700,
+    }),
+    signal: abortSignal,
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => '');
+    const err = new Error(`Groq API error (${response.status}): ${errText || response.statusText}`);
+    err.status = response.status;
+    throw err;
+  }
+
+  return response;
+}
+
+async function streamGroqChat(groqApiKey, sanitizedHistory, imageDataUrl, systemInstruction, onDelta, abortSignal) {
+  const hasImage = Boolean(imageDataUrl && parseDataUrl(imageDataUrl));
+  const buildMessages = (includeImage) => {
+    const msgs = [{ role: 'system', content: systemInstruction }];
+    sanitizedHistory.forEach((msg, idx) => {
+      const role = msg.role === 'model' ? 'assistant' : 'user';
+      const isLastUser = idx === sanitizedHistory.length - 1 && role === 'user';
+      if (isLastUser && includeImage) {
+        msgs.push({
+          role: 'user',
+          content: [
+            { type: 'text', text: msg.text },
+            { type: 'image_url', image_url: { url: imageDataUrl } },
+          ],
+        });
+      } else {
+        msgs.push({ role, content: msg.text });
+      }
+    });
+    return msgs;
+  };
+
+  let response;
+  if (hasImage) {
+    try {
+      response = await sendGroqRequest(
+        groqApiKey,
+        'meta-llama/llama-4-scout-17b-16e-instruct',
+        buildMessages(true),
+        abortSignal
+      );
+    } catch (err) {
+      if (err?.status === 400 || err?.status === 404) {
+        response = await sendGroqRequest(
+          groqApiKey,
+          'llama-3.3-70b-versatile',
+          buildMessages(false),
+          abortSignal
+        );
+      } else {
+        throw err;
+      }
+    }
+  } else {
+    response = await sendGroqRequest(
+      groqApiKey,
+      'llama-3.3-70b-versatile',
+      buildMessages(false),
+      abortSignal
+    );
+  }
+
+  if (!response.body) {
+    throw new Error('Groq streaming response unavailable.');
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let emittedAny = false;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const dataStr = trimmed.slice(5).trim();
+      if (dataStr === '[DONE]') continue;
+      try {
+        const json = JSON.parse(dataStr);
+        const delta = json?.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          emittedAny = true;
+          onDelta(delta);
+        }
+      } catch {
+        // Skip partial SSE frame
+      }
+    }
+  }
+
+  return emittedAny;
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '12mb' }));
 
   app.get('/api/health', (_req, res) => {
+    const geminiConfigured = Boolean(process.env.GEMINI_API_KEY);
+    const groqConfigured = Boolean(process.env.GROQ_API_KEY);
     res.json({
       ok: true,
-      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      geminiConfigured,
+      groqConfigured,
+      aiConfigured: geminiConfigured || groqConfigured,
     });
   });
 
   app.post('/api/chat', async (req, res) => {
+    const groqApiKey = process.env.GROQ_API_KEY;
     const ai = createGeminiClient();
-    if (!ai) {
+    if (!ai && !groqApiKey) {
       res.status(503).json({
-        error: 'GEMINI_API_KEY is not configured on the server. Add it in Settings > Secrets.',
+        error: 'No AI API key configured. Set GROQ_API_KEY or GEMINI_API_KEY in environment variables.',
       });
       return;
     }
@@ -155,7 +284,7 @@ async function startServer() {
 
     const sanitizedHistory = messages
       .filter((m) => m && (m.role === 'user' || m.role === 'model') && typeof m.text === 'string' && m.text.trim().length > 0)
-      .slice(-16);
+      .slice(-10);
 
     if (sanitizedHistory.length === 0) {
       res.status(400).json({ error: 'At least one non-empty message is required.' });
@@ -208,6 +337,7 @@ async function startServer() {
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
+    res.write(': connected\n\n');
 
     const writeEvent = (event, data) => {
       res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -220,63 +350,65 @@ async function startServer() {
       }
     });
 
+    const upstreamSignal = AbortSignal.any([clientAbort.signal, AbortSignal.timeout(20000)]);
+
     try {
-      // Primary ultra-fast low-latency model: gemini-3.1-flash-lite (minimal thinking = instant first token),
-      // or gemini-4-hydrogen with ThinkingLevel.LOW if flash-lite is unavailable.
       let emitted = false;
-      const primaryController = new AbortController();
-      const firstTokenTimer = setTimeout(() => {
-        if (!emitted) primaryController.abort();
-      }, 6000);
 
-      const onAbort = () => primaryController.abort();
-      clientAbort.signal.addEventListener('abort', onAbort);
-
-      const t0 = Date.now();
-      let primaryErrMsg = '';
-      try {
-        emitted = await streamChatModel(
-          ai,
-          'gemini-3.1-flash-lite',
-          ThinkingLevel.MINIMAL,
-          contents,
-          systemInstruction,
-          (delta) => {
-            clearTimeout(firstTokenTimer);
-            writeEvent('delta', { text: delta });
-          },
-          primaryController.signal
-        );
-      } catch (primaryErr) {
-        clearTimeout(firstTokenTimer);
-        primaryErrMsg = `[flash-lite ${Date.now() - t0}ms: ${primaryErr?.message || primaryErr}]`;
-        if (clientAbort.signal.aborted) {
-          return;
+      if (groqApiKey) {
+        try {
+          emitted = await streamGroqChat(
+            groqApiKey,
+            sanitizedHistory,
+            imageDataUrl,
+            systemInstruction,
+            (delta) => writeEvent('delta', { text: delta }),
+            upstreamSignal
+          );
+        } catch (groqErr) {
+          if (clientAbort.signal.aborted || !ai) {
+            throw groqErr;
+          }
         }
-        // Fallback to gemini-4-hydrogen with ThinkingLevel.LOW
-        if (!emitted) {
-          const t1 = Date.now();
-          try {
-            await streamChatModel(
+      }
+
+      if (!emitted && ai) {
+        try {
+          emitted = await withRetry(() =>
+            streamChatModel(
               ai,
-              'gemini-4-hydrogen',
-              ThinkingLevel.LOW,
+              'gemini-3.1-flash-lite',
+              ThinkingLevel.MINIMAL,
               contents,
               systemInstruction,
               (delta) => {
                 writeEvent('delta', { text: delta });
               },
-              clientAbort.signal
-            );
-          } catch (fallbackErr) {
-            throw new Error(`${primaryErrMsg} [hydrogen ${Date.now() - t1}ms: ${fallbackErr?.message || fallbackErr}]`);
+              upstreamSignal
+            )
+          );
+        } catch (primaryErr) {
+          if (clientAbort.signal.aborted) {
+            return;
           }
-        } else {
-          throw primaryErr;
+          if (!emitted) {
+            await withRetry(() =>
+              streamChatModel(
+                ai,
+                'gemini-4-hydrogen',
+                ThinkingLevel.LOW,
+                contents,
+                systemInstruction,
+                (delta) => {
+                  writeEvent('delta', { text: delta });
+                },
+                upstreamSignal
+              )
+            );
+          } else {
+            throw primaryErr;
+          }
         }
-      } finally {
-        clearTimeout(firstTokenTimer);
-        clientAbort.signal.removeEventListener('abort', onAbort);
       }
 
       writeEvent('done', { ok: true });
@@ -286,7 +418,12 @@ async function startServer() {
         res.end();
         return;
       }
-      const formatted = formatGeminiError(error);
+      if (error?.name === 'TimeoutError' || error?.name === 'AbortError') {
+        writeEvent('error', { message: 'AI provider took too long to respond. Please try again.' });
+        res.end();
+        return;
+      }
+      const formatted = formatChatError(error);
       writeEvent('error', { message: formatted.message });
       res.end();
     }
@@ -364,25 +501,25 @@ async function startServer() {
 
       res.json({ detections });
     } catch (error) {
-      const formatted = formatGeminiError(error);
+      const formatted = formatChatError(error);
       res.status(formatted.status).json({ error: formatted.message });
     }
   });
 
   const PROJECT_EXPORT_FILES = [
-    '.env.example',
-    '.gitignore',
-    'index.html',
-    'metadata.json',
-    'package.json',
-    'server.mjs',
-    'tsconfig.json',
-    'vite.config.ts',
-    'src/app.js',
-    'src/chat.js',
-    'src/detector.js',
-    'src/index.css',
-    'src/theme.js',
+    { src: '.env.example', dest: '.env.example' },
+    { src: '.gitignore', dest: '.gitignore' },
+    { src: 'index.html', dest: 'index.html' },
+    { src: 'metadata.json', dest: 'metadata.json' },
+    { src: 'package.json', dest: 'package.json' },
+    { src: 'server.mjs', dest: 'server.mjs' },
+    { src: 'tsconfig.json', dest: 'tsconfig.json' },
+    { src: 'vite.config.ts', dest: 'vite.config.ts' },
+    { src: 'src/app.js', dest: 'app.js' },
+    { src: 'src/chat.js', dest: 'chat.js' },
+    { src: 'src/detector.js', dest: 'detector.js' },
+    { src: 'src/index.css', dest: 'index.css' },
+    { src: 'src/theme.js', dest: 'theme.js' },
   ];
 
   const EXPORT_README = [
@@ -395,8 +532,9 @@ async function startServer() {
     '   npm install',
     '   ```',
     '',
-    '2. Create a `.env` file in the project root with your own Gemini API key (from https://aistudio.google.com/apikey):',
+    '2. Create a `.env` file in the project root with your Groq API key (free at https://console.groq.com/keys) and/or Gemini API key:',
     '   ```env',
+    '   GROQ_API_KEY="YOUR_GROQ_API_KEY"',
     '   GEMINI_API_KEY="YOUR_GEMINI_API_KEY"',
     '   PORT=3000',
     '   ```',
@@ -409,7 +547,7 @@ async function startServer() {
     '   ```',
     '',
     'Note: Object detection (TensorFlow.js COCO-SSD) runs directly in the browser.',
-    'The AI Chatbot calls `/api/chat` on `server.mjs`, so host with Node.js (e.g., Render, Railway, Cloud Run, Fly.io, or a VPS) and set `GEMINI_API_KEY` in environment variables.',
+    'The AI Chatbot calls `/api/chat` on `server.mjs`, so host with Node.js (e.g., Render, Railway, Cloud Run, Fly.io, or a VPS) and set `GROQ_API_KEY` (or `GEMINI_API_KEY`) in environment variables.',
     '',
   ].join('\n');
 
@@ -429,48 +567,51 @@ async function startServer() {
     const centralParts = [];
     let offset = 0;
 
+    // Valid MS-DOS timestamp (2026-11-17 10:00:00) so Windows File Explorer never rejects 0x0000 dates
+    const dosTime = 0x5000;
+    const dosDate = 0x5d71;
+
     for (const entry of entries) {
       const nameBuf = Buffer.from(entry.name, 'utf8');
       const rawData = Buffer.isBuffer(entry.data) ? entry.data : Buffer.from(entry.data, 'utf8');
-      const compressed = zlib.deflateRawSync(rawData);
       const crc = crc32(rawData);
 
       const localHeader = Buffer.alloc(30);
       localHeader.writeUInt32LE(0x04034b50, 0);
-      localHeader.writeUInt16LE(20, 4);
-      localHeader.writeUInt16LE(0x0800, 6);
-      localHeader.writeUInt16LE(8, 8);
-      localHeader.writeUInt16LE(0, 10);
-      localHeader.writeUInt16LE(0, 12);
+      localHeader.writeUInt16LE(10, 4); // version needed: 1.0 (STORE)
+      localHeader.writeUInt16LE(0, 6);  // flags: 0 (pure ASCII paths)
+      localHeader.writeUInt16LE(0, 8);  // method: 0 (STORE - universal compatibility)
+      localHeader.writeUInt16LE(dosTime, 10);
+      localHeader.writeUInt16LE(dosDate, 12);
       localHeader.writeUInt32LE(crc, 14);
-      localHeader.writeUInt32LE(compressed.length, 18);
+      localHeader.writeUInt32LE(rawData.length, 18);
       localHeader.writeUInt32LE(rawData.length, 22);
       localHeader.writeUInt16LE(nameBuf.length, 26);
       localHeader.writeUInt16LE(0, 28);
 
-      localParts.push(localHeader, nameBuf, compressed);
+      localParts.push(localHeader, nameBuf, rawData);
 
       const centralHeader = Buffer.alloc(46);
       centralHeader.writeUInt32LE(0x02014b50, 0);
-      centralHeader.writeUInt16LE(20, 4);
-      centralHeader.writeUInt16LE(20, 6);
-      centralHeader.writeUInt16LE(0x0800, 8);
-      centralHeader.writeUInt16LE(8, 10);
-      centralHeader.writeUInt16LE(0, 12);
-      centralHeader.writeUInt16LE(0, 14);
+      centralHeader.writeUInt16LE(20, 4); // version made by: 2.0 (MS-DOS/Windows)
+      centralHeader.writeUInt16LE(10, 6); // version needed: 1.0
+      centralHeader.writeUInt16LE(0, 8);
+      centralHeader.writeUInt16LE(0, 10); // method: 0 (STORE)
+      centralHeader.writeUInt16LE(dosTime, 12);
+      centralHeader.writeUInt16LE(dosDate, 14);
       centralHeader.writeUInt32LE(crc, 16);
-      centralHeader.writeUInt32LE(compressed.length, 20);
+      centralHeader.writeUInt32LE(rawData.length, 20);
       centralHeader.writeUInt32LE(rawData.length, 24);
       centralHeader.writeUInt16LE(nameBuf.length, 28);
       centralHeader.writeUInt16LE(0, 30);
       centralHeader.writeUInt16LE(0, 32);
       centralHeader.writeUInt16LE(0, 34);
       centralHeader.writeUInt16LE(0, 36);
-      centralHeader.writeUInt32LE(0, 38);
+      centralHeader.writeUInt32LE(0x20, 38); // Windows archive file attribute
       centralHeader.writeUInt32LE(offset, 42);
 
       centralParts.push(centralHeader, nameBuf);
-      offset += localHeader.length + nameBuf.length + compressed.length;
+      offset += localHeader.length + nameBuf.length + rawData.length;
     }
 
     const centralDir = Buffer.concat(centralParts);
@@ -495,12 +636,20 @@ async function startServer() {
     }
 
     const entries = [{ name: 'ai-vision-project/README.md', data: EXPORT_README }];
-    for (const relPath of PROJECT_EXPORT_FILES) {
-      const absPath = path.resolve(__dirname, relPath);
+    for (const item of PROJECT_EXPORT_FILES) {
+      const absPath = path.resolve(__dirname, item.src);
       if (fs.existsSync(absPath)) {
+        let data = fs.readFileSync(absPath);
+        if (item.dest === 'index.html') {
+          const rewritten = data
+            .toString('utf8')
+            .replace('href="/src/index.css"', 'href="/index.css"')
+            .replace('src="/src/app.js"', 'src="/app.js"');
+          data = Buffer.from(rewritten, 'utf8');
+        }
         entries.push({
-          name: `ai-vision-project/${relPath}`,
-          data: fs.readFileSync(absPath),
+          name: `ai-vision-project/${item.dest}`,
+          data,
         });
       }
     }

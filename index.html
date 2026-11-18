@@ -3,15 +3,15 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <title>AI Vision — Live Object Detection &amp; AI Chatbot</title>
+    <title>SEE IT ! — Live Object Detection &amp; AI Chatbot</title>
     <meta
       name="description"
-      content="AI-powered computer vision platform with real-time object detection, live camera tracking, image upload analysis, and a Gemini AI chatbot."
+      content="AI-powered computer vision platform with real-time object detection, live camera tracking, image upload analysis, and a Groq AI chatbot."
     />
-    <meta property="og:title" content="AI Vision — Live Object Detection &amp; AI Chatbot" />
+    <meta property="og:title" content="SEE IT ! — Live Object Detection &amp; AI Chatbot" />
     <meta
       property="og:description"
-      content="AI-powered computer vision platform with real-time object detection, live camera tracking, image upload analysis, and a Gemini AI chatbot."
+      content="AI-powered computer vision platform with real-time object detection, live camera tracking, image upload analysis, and a Groq AI chatbot."
     />
     <meta property="og:type" content="website" />
     <meta name="twitter:card" content="summary_large_image" />
@@ -21,7 +21,7 @@
       href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/src/index.css" />
+    <link rel="stylesheet" href="/index.css" />
     <script>
       (function () {
         try {
@@ -41,8 +41,15 @@
       <header class="top-bar">
         <div class="top-bar-controls">
           <div class="api-status-pill" id="api-status-pill">
-            <span class="api-badge-dot" aria-hidden="true">G</span>
-            <span class="api-status-name">Gemini API</span>
+            <span class="api-badge-groq" aria-hidden="true">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path
+                  d="M12 3a9 9 0 1 0 9 9v-1.5h-7.5v3h4.2A5.5 5.5 0 1 1 12 6.5c1.66 0 3.15.74 4.16 1.9l2.44-2.44A8.96 8.96 0 0 0 12 3Z"
+                  fill="currentColor"
+                />
+              </svg>
+            </span>
+            <span class="api-status-name" id="api-status-name">Groq API</span>
             <span class="status-dot status-dot-green" id="api-status-dot" aria-hidden="true"></span>
             <span class="api-status-state" id="api-status-text">Connected</span>
           </div>
@@ -249,10 +256,10 @@
       </main>
 
       <footer class="app-footer">
-        <p class="app-footer-text">Hello everyone , I am Chirayu and i have made this web page with my friend davin and free Gemini API's</p>
+        <p class="app-footer-text">Hello everyone , I am Chirayu and i have made this web page with my friend davin and free Groq API's</p>
       </footer>
     </div>
 
-    <script type="module" src="/src/app.js"></script>
+    <script type="module" src="/app.js"></script>
   </body>
 </html>
